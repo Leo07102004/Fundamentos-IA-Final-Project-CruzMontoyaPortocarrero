@@ -5,19 +5,28 @@ import numpy as np
 from connect4.policy import Policy
 
 
-ITERATION_BUDGET = 400
-TIME_BUDGET_S = 0.35
-UCB_C = math.sqrt(2)
+# Hiperparametros del agente
+ITERATION_BUDGET = 800     # simulaciones MCTS por jugada (subido desde 400)
+TIME_BUDGET_S = 0.45       # limite duro de tiempo (segundos)
+UCB_C = 1.4                # exploracion UCB1 (calibrado para factor de rama 7)
+ROLLOUT_HEURISTIC = True   # rollout con gana/bloquea inmediato
 
 ROWS, COLS = 6, 7
+# Orden centro-primero: las columnas centrales tienen mas diagonales y son
+# estrategicamente superiores. Esto sesga la expansion del arbol.
 COL_ORDER = [3, 2, 4, 1, 5, 0, 6]
 
 
+# --------------------------------------------------------------------------
+# Utilidades de tablero (numpy plano, sin ConnectState)
+# --------------------------------------------------------------------------
+
 def _free_cols(board):
-    return [c for c in range(COLS) if board[0, c] == 0]
+    return [c for c in COL_ORDER if board[0, c] == 0]
 
 
 def _drop(board, col, player):
+    """Coloca ficha y devuelve (nuevo_tablero, fila) o (None, -1)."""
     for r in range(ROWS - 1, -1, -1):
         if board[r, col] == 0:
             nb = board.copy()
@@ -27,6 +36,7 @@ def _drop(board, col, player):
 
 
 def _wins_at(b, r, c, p):
+    """True si la pieza p en (r,c) cierra un 4-en-linea."""
     for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
         count = 1
         rr, cc = r + dr, c + dc
@@ -75,6 +85,28 @@ def _initial_heights(board):
     return h
 
 
+def _count_immediate_wins(board, heights, player):
+    """Cuenta cuantas columnas darian victoria inmediata a `player`.
+    Usa el vector de alturas para evitar copiar el tablero. Solo escribe y
+    revierte la celda donde caeria la ficha."""
+    wins = 0
+    winning_cols = []
+    for c in COL_ORDER:
+        if heights[c] >= ROWS:
+            continue
+        r = ROWS - 1 - heights[c]
+        board[r, c] = player
+        if _wins_at(board, r, c, player):
+            wins += 1
+            winning_cols.append(c)
+        board[r, c] = 0
+    return wins, winning_cols
+
+
+# --------------------------------------------------------------------------
+# Nodo MCTS
+# --------------------------------------------------------------------------
+
 class _Node:
     __slots__ = ("board", "player", "parent", "action", "children", "untried", "N", "W")
 
@@ -84,6 +116,7 @@ class _Node:
         self.parent = parent
         self.action = action
         self.children = {}
+        # Expansion en orden centro -> bordes (mejora calidad MCTS gratis)
         self.untried = _free_cols(board) if not _is_final(board) else []
         self.N = 0
         self.W = 0.0
@@ -105,7 +138,7 @@ class _Node:
         best = None
         best_score = -float("inf")
         for child in self.children.values():
-            exploit = -child.q_hat
+            exploit = -child.q_hat   # suma cero: invertir para perspectiva del padre
             explore = c * math.sqrt(log_n / child.N)
             score = exploit + explore
             if score > best_score:
@@ -113,10 +146,41 @@ class _Node:
         return best
 
 
+# --------------------------------------------------------------------------
+# Motor MCTS
+# --------------------------------------------------------------------------
+
 class _MCTS:
     def __init__(self, rng, c=UCB_C):
         self.rng = rng
         self.c = c
+
+    def _rollout_choose(self, board, heights, player):
+        """Elige columna en el rollout: prioriza ganar inmediato, luego bloquear,
+        luego centro-aleatorio. Reduce varianza vs aleatorio puro."""
+        # 1. Ganar inmediato si puedo
+        for c in COL_ORDER:
+            if heights[c] >= ROWS:
+                continue
+            r = ROWS - 1 - heights[c]
+            board[r, c] = player
+            won = _wins_at(board, r, c, player)
+            board[r, c] = 0
+            if won:
+                return c
+        # 2. Bloquear si el rival gana inmediato
+        for c in COL_ORDER:
+            if heights[c] >= ROWS:
+                continue
+            r = ROWS - 1 - heights[c]
+            board[r, c] = -player
+            opp_won = _wins_at(board, r, c, -player)
+            board[r, c] = 0
+            if opp_won:
+                return c
+        # 3. Aleatorio (orden centro-primero ya esta implicito en legal)
+        legal = [c for c in range(COLS) if heights[c] < ROWS]
+        return legal[int(self.rng.integers(len(legal)))]
 
     def _simulate(self, board, player, root_player):
         b = board.copy()
@@ -125,10 +189,13 @@ class _MCTS:
         total = int(np.count_nonzero(b))
 
         while True:
-            legal = [c for c in range(COLS) if heights[c] < ROWS]
-            if not legal:
+            if all(h >= ROWS for h in heights):
                 return 0.0
-            a = legal[int(self.rng.integers(len(legal)))]
+            if ROLLOUT_HEURISTIC:
+                a = self._rollout_choose(b, heights, p)
+            else:
+                legal = [c for c in range(COLS) if heights[c] < ROWS]
+                a = legal[int(self.rng.integers(len(legal)))]
             r = ROWS - 1 - heights[a]
             b[r, a] = p
             heights[a] += 1
@@ -143,8 +210,8 @@ class _MCTS:
         node = root
         while not node.is_terminal:
             if not node.is_fully_expanded:
-                idx = int(self.rng.integers(len(node.untried)))
-                action = node.untried.pop(idx)
+                # Expandir en orden centro-primero (pop(0)) en vez de aleatorio
+                action = node.untried.pop(0)
                 nb, _ = _drop(node.board, action, node.player)
                 child = _Node(nb, -node.player, parent=node, action=action)
                 node.children[action] = child
@@ -160,7 +227,8 @@ class _MCTS:
             node.W += sign * reward_root
             node = node.parent
 
-    def search(self, board, current_player, iterations, time_budget_s, allowed_actions=None):
+    def search(self, board, current_player, iterations, time_budget_s,
+               allowed_actions=None):
         root = _Node(board, current_player)
         if allowed_actions is not None:
             root.untried = [a for a in root.untried if a in allowed_actions]
@@ -181,8 +249,13 @@ class _MCTS:
         if not root.children:
             choices = allowed_actions if allowed_actions else _free_cols(board)
             return int(self.rng.choice(choices))
+        # Robust child: accion mas visitada (estandar MCTS)
         return max(root.children.items(), key=lambda kv: kv[1].N)[0]
 
+
+# --------------------------------------------------------------------------
+# Politica expuesta al torneo
+# --------------------------------------------------------------------------
 
 class Portocarrero(Policy):
 
@@ -205,50 +278,84 @@ class Portocarrero(Policy):
         n_yel = int((board == 1).sum())
         current_player = -1 if n_red == n_yel else 1
 
+        heights = _initial_heights(board)
         legal = _free_cols(board)
         if not legal:
             return 0
 
-        # (a) jugada ganadora inmediata
+        # ============ Capa tactica 0: ganar inmediato ===================
         for a in legal:
-            nb, r = _drop(board, a, current_player)
-            if nb is not None and _wins_at(nb, r, a, current_player):
+            r = ROWS - 1 - heights[a]
+            board[r, a] = current_player
+            won = _wins_at(board, r, a, current_player)
+            board[r, a] = 0
+            if won:
                 return int(a)
 
-        # (b) bloquear jugada ganadora del rival
-        for a in legal:
-            nb, _ = _drop(board, a, current_player)
-            if nb is None or _is_final(nb):
-                continue
-            opp_legal = _free_cols(nb)
-            for b in opp_legal:
-                nb2, r2 = _drop(nb, b, -current_player)
-                if nb2 is not None and _wins_at(nb2, r2, b, -current_player):
-                    if b in legal:
-                        return int(b)
-                    break
+        # ============ Capa tactica 1: bloquear amenaza inmediata ========
+        opp_wins, opp_winning_cols = _count_immediate_wins(
+            board, heights, -current_player
+        )
+        if opp_wins >= 1:
+            # Si hay 2+ amenazas, no podemos bloquear todas: estamos perdidos,
+            # bloquea cualquiera y reza (MCTS no salvara nada aqui).
+            return int(opp_winning_cols[0])
 
-        # (c) descartar jugadas suicidas
+        # ============ Capa tactica 2: DOBLE AMENAZA (lookahead 2-ply) ===
+        # Si puedo jugar una columna que me deja con 2 victorias en 1, gano
+        # forzado (el rival solo puede bloquear una). Esto detecta jugadas
+        # ganadoras que MCTS podria no descubrir con presupuesto bajo.
+        for a in legal:
+            r = ROWS - 1 - heights[a]
+            board[r, a] = current_player
+            heights[a] += 1
+            my_wins, _ = _count_immediate_wins(board, heights, current_player)
+            # Tambien hay que verificar que el rival no gane primero
+            opp_threats, _ = _count_immediate_wins(board, heights, -current_player)
+            heights[a] -= 1
+            board[r, a] = 0
+            if my_wins >= 2 and opp_threats == 0:
+                return int(a)
+
+        # ============ Capa tactica 3: filtrar jugadas suicidas ==========
+        # Descartar columnas que regalan al rival victoria inmediata (1-ply)
+        # o doble amenaza (2-ply, el rival nos forzaria a perder).
         safe = []
         for a in legal:
-            nb, _ = _drop(board, a, current_player)
-            if nb is None:
-                continue
-            if _is_final(nb):
+            r = ROWS - 1 - heights[a]
+            board[r, a] = current_player
+            heights[a] += 1
+            # ¿el rival gana inmediato tras mi jugada?
+            opp_wins_now, _ = _count_immediate_wins(
+                board, heights, -current_player
+            )
+            # ¿el rival puede crear doble amenaza tras mi jugada?
+            opp_creates_double = False
+            if opp_wins_now == 0:
+                for b in range(COLS):
+                    if heights[b] >= ROWS:
+                        continue
+                    rb = ROWS - 1 - heights[b]
+                    board[rb, b] = -current_player
+                    heights[b] += 1
+                    opp_after, _ = _count_immediate_wins(
+                        board, heights, -current_player
+                    )
+                    heights[b] -= 1
+                    board[rb, b] = 0
+                    if opp_after >= 2:
+                        opp_creates_double = True
+                        break
+            heights[a] -= 1
+            board[r, a] = 0
+            if opp_wins_now == 0 and not opp_creates_double:
                 safe.append(a)
-                continue
-            opp_wins = False
-            for b in _free_cols(nb):
-                nb2, r2 = _drop(nb, b, -current_player)
-                if nb2 is not None and _wins_at(nb2, r2, b, -current_player):
-                    opp_wins = True
-                    break
-            if not opp_wins:
-                safe.append(a)
+
         if not safe:
             safe = legal
         allowed = safe if len(safe) < len(legal) else None
 
+        # ============ Capa estrategica: MCTS-UCB1 =======================
         action = self._mcts.search(
             board,
             current_player,
