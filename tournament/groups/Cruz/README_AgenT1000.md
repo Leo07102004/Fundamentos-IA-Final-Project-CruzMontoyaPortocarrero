@@ -74,7 +74,7 @@ class AgenT1000(Policy):
 Para usarlo en el torneo, debe estar ubicado en:
 
 ```text
-groups/Group C/policy.py
+groups/Cruz/policy.py
 ```
 
 Además, el archivo `q_values.pkl` debe estar en la misma carpeta que `policy.py`, porque el agente lo carga con:
