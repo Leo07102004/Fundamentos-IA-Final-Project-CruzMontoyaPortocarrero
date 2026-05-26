@@ -49,7 +49,7 @@ Si puedo jugar una columna que me deja con **dos victorias en uno** simultáneas
 
 Se descartan columnas que **regalan al rival una victoria inmediata o una doble amenaza** en su próximo turno. MCTS solo busca entre las acciones que sobreviven a este filtro.
 
-![Capa 3](fig_p4_filter.png)
+
 
 ### Capa estratégica — MCTS-UCB1
 
